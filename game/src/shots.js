@@ -1,79 +1,128 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=start|street|chase|mission. Each one plays the real
+// rules forward from a fresh world for a fixed number of steps, steered by a small
+// autopilot, so the frame is what real gameplay looks like and the same seed always
+// gives the same frame. The camera is fixed per shot for a deterministic framing.
+import { STEP } from './config.js';
+import { createCar } from './vehicles.js';
+import { createRival } from './combat.js';
+import { SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+/** Frame the camera behind the player (or their car) from the final state. */
+function frameBehind(renderer, state) {
+  const p = state.player;
+  const inCar = !p.onFoot && p.car;
+  const x = inCar ? p.car.x : p.x;
+  const z = inCar ? p.car.z : p.z;
+  const a = inCar ? p.car.angle : p.angle;
+  const fx = Math.sin(a);
+  const fz = Math.cos(a);
+  const dist = inCar ? 13 : 9;
+  renderer.setShotCamera(x - fx * dist, 5.5, z - fz * dist, x + fx * 10, 1.5, z + fz * 10);
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Frame the camera ahead of the player, looking back at them and down the road behind
+ * them — for a chase, the pursuing police are in the frame behind the player's car.
  */
-export function stageShot(name, world) {
+function frameChase(renderer, state) {
+  const p = state.player;
+  const car = p.car;
+  const a = car.angle;
+  const fx = Math.sin(a);
+  const fz = Math.cos(a);
+  const rx = Math.cos(a);
+  const rz = -Math.sin(a);
+  renderer.setShotCamera(
+    car.x + fx * 16 + rx * 9, 5.5, car.z + fz * 16 + rz * 9,
+    car.x - fx * 12, 1.5, car.z - fz * 12
+  );
+}
+
+function emptyActions() {
+  return {
+    moveX: 0, moveZ: 0, throttle: 0, steer: 0, run: false,
+    interact: false, interactHeld: false, shoot: false, aimX: 0, aimZ: 0,
+  };
+}
+
+/**
+ * Set `world` to the named scene and return the screen to draw over it.
+ * `renderer` is used only to fix the shot camera.
+ */
+export function stageShot(name, world, renderer) {
+  const state = world.state;
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+
+  if (name === 'street') {
+    // On foot on a sidewalk, walking east past traffic.
+    state.player.x = -60;
+    state.player.z = 35;
+    state.player.angle = Math.PI / 2;
+    for (let i = 0; i < 6 / STEP; i += 1) {
+      const actions = emptyActions();
+      actions.moveX = 1;
+      world.step(STEP, actions);
+    }
+    frameBehind(renderer, state);
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'chase') {
+    // The delivery with a tail: three stars, police in pursuit, driving east.
+    state.mission.index = 2;
+    state.mission.stage = 1;
+    const car = createCar(state, { kind: 'player', x: -180, z: 30, angle: Math.PI / 2, color: 0xc0392b, random: state.random });
+    car.driver = 'player';
+    state.player.car = car;
+    state.player.onFoot = false;
+    state.player.x = car.x;
+    state.player.z = car.z;
+    // High heat: it decays while the police close in, and three stars must survive it.
+    state.heat = 78;
+    state.lastCrime = state.time;
+    // Cruise at 22 m/s: fast enough to read as a chase, slow enough that the police
+    // (38 m/s) close in and stay in the frame behind the car.
+    for (let i = 0; i < 9 / STEP; i += 1) {
+      const actions = emptyActions();
+      actions.throttle = car.speed < 22 ? 1 : 0;
+      actions.steer = Math.max(-1, Math.min(1, angleDiff(Math.PI / 2, car.angle) * 2));
+      world.step(STEP, actions);
+    }
+    frameChase(renderer, state);
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'mission') {
+    // The marina hit: four rivals, the player closing in on foot.
+    const L = state.city.landmarks;
+    state.mission.index = 3;
+    state.mission.stage = 1;
+    state.mission.rivalsSpawned = true;
+    const spots = [[-14, -8], [10, -12], [16, 6], [-8, 10]];
+    for (const [dx, dz] of spots) createRival(state, L.marina.x + dx, L.marina.z + dz);
+    state.player.x = 0;
+    state.player.z = 224;
+    state.player.angle = 0;
+    for (let i = 0; i < 3 / STEP; i += 1) {
+      const actions = emptyActions();
+      actions.moveZ = 1;
+      world.step(STEP, actions);
+    }
+    // High and wide, from behind the player: the player in the foreground, the crew
+    // and the marina ahead, the sea behind them.
+    renderer.setShotCamera(state.player.x, 14, state.player.z - 26, L.marina.x, 1, L.marina.z);
+    return { screen: SCREEN_PLAY, best: 0 };
+  }
+
+  // Default (start): an ambient city backdrop under the title screen.
+  for (let i = 0; i < 8 / STEP; i += 1) world.step(STEP, emptyActions());
+  renderer.setShotCamera(90, 60, 140, 0, 10, -60);
+  return { screen: SCREEN_TITLE, best: 0 };
 }
